@@ -50,11 +50,14 @@ function nodePositions(yard) {
 
 /* ---------------- SVG 渲染 ---------------- */
 function sectionStatus(snap, sectionId) {
-  const lock = (snap.locks || []).find((l) => l.resource_type === 'section' && l.resource_id === sectionId);
+  // 直接区段锁与侧防实体锁（flank_section）都使区段处于锁闭态
+  const lock = (snap.locks || []).find(
+    (l) => (l.resource_type === 'section' || l.resource_type === 'flank_section') && l.resource_id === sectionId);
   const inst = lock && (snap.instances || []).find((i) => i.id === lock.instance_id);
   if (snap.occupancy && snap.occupancy[sectionId]) return { color: '#d9534f', label: '占用', lock, inst };
   if (lock) {
     if (inst && inst.status === 'faulted') return { color: '#7a2222', label: '故障锁闭', lock, inst };
+    if (lock.resource_type === 'flank_section') return { color: '#e0a800', label: '侧防锁闭', lock, inst };
     return { color: '#e0a800', label: '锁闭', lock, inst };
   }
   return { color: '#5a6b80', label: '空闲', lock: null, inst: null };
@@ -107,38 +110,42 @@ function renderYard() {
   Object.entries(pos).forEach(([nid, p]) => {
     const sw = switchByNode[nid];
     if (sw) {
-      const lock = (snap.locks || []).find((l) => l.resource_type === 'switch' && l.resource_id === sw.id);
+      // 直接道岔锁与侧防实体锁（flank_switch）都使道岔处于锁闭态
+      const lock = (snap.locks || []).find(
+        (l) => (l.resource_type === 'switch' || l.resource_type === 'flank_switch') && l.resource_id === sw.id);
       const inst = lock && (snap.instances || []).find((i) => i.id === lock.instance_id);
       const fault = inst && inst.status === 'faulted';
+      const flankOnly = lock && lock.resource_type === 'flank_switch';
       const circle = svgEl('circle', {
         cx: p.x, cy: p.y, r: 9,
         fill: fault ? '#7a2222' : lock ? '#e0a800' : '#2e3a49',
         stroke: '#d8dee9', 'stroke-width': 1.2,
       });
-      circle.appendChild(svgEl('title', {}, `${sw.id}${lock ? ` 锁闭:${lock.switch_position}（${lock.route_id}）` : ''}`));
+      circle.appendChild(svgEl('title', {}, `${sw.id}${lock ? (flankOnly ? ` 侧防锁闭（${lock.route_id}）` : ` 锁闭:${lock.switch_position}（${lock.route_id}）`) : ''}`));
       svg.appendChild(circle);
       const t = svgEl('text', {
         x: p.x, y: p.y - 18, 'text-anchor': 'middle', class: 'switch-mark',
         fill: fault ? '#ff8089' : '#ffd479',
-      }, `${sw.id}${lock ? ':' + lock.switch_position[0].toUpperCase() : ''}`);
+      }, `${sw.id}${lock && !flankOnly && lock.switch_position ? ':' + lock.switch_position[0].toUpperCase() : ''}`);
       svg.appendChild(t);
     } else {
       svg.appendChild(svgEl('circle', { cx: p.x, cy: p.y, r: 5, class: 'node-dot' }));
     }
   });
 
-  // 侧防（通用）资源牌
-  const generic = (yard.resources || []).filter((r) => r.kind === 'generic');
-  generic.forEach((r, i) => {
+  // 侧防资源牌：generic 独立互斥；section/switch 与所指实体共享冲突判断
+  (yard.resources || []).forEach((r, i) => {
     const lock = (snap.locks || []).find((l) => l.resource_type === 'flank' && l.resource_id === r.id);
     const inst = lock && (snap.instances || []).find((x) => x.id === lock.instance_id);
     const gx = Math.min(...xs) - 40, gy = Math.min(...ys) - 40 + i * 26;
-    const rect = svgEl('rect', { x: gx, y: gy - 14, width: 120, height: 20, rx: 5,
+    const rect = svgEl('rect', { x: gx, y: gy - 14, width: 150, height: 20, rx: 5,
       fill: inst && inst.status === 'faulted' ? '#7a2222' : lock ? '#8a6a1f' : '#222d3a',
       stroke: '#3b4a5e', strokewidth: 1 });
+    const refTxt = r.kind === 'generic' ? '' : `→${r.ref}`;
     const txt = svgEl('text', { x: gx + 6, y: gy, fill: '#d8dee9', 'font-size': 11, 'font-family': 'ui-monospace, Menlo, monospace' },
-      `🛡 ${r.id}${lock ? '🔒' : ''}`);
-    txt.appendChild(svgEl('title', {}, `侧防 ${r.id}${lock ? `，被 ${lock.route_id} 锁闭` : ''}`));
+      `🛡 ${r.id}${refTxt}${lock ? '🔒' : ''}`);
+    txt.appendChild(svgEl('title', {},
+      `侧防 ${r.id}（${r.kind}${r.kind === 'generic' ? '，独立互斥' : `，与${r.kind === 'section' ? '区段' : '道岔'} ${r.ref} 共享冲突判断`}）${lock ? `，被 ${lock.route_id} 锁闭` : ''}`));
     svg.appendChild(rect); svg.appendChild(txt);
   });
 }
@@ -181,7 +188,7 @@ async function requestRoute(routeId, btn) {
         <pre>锁定：${r.locked.map((l) => `${l.type}:${l.resource}${l.switch_position ? '=' + l.switch_position : ''}`).join('\n')}</pre>`;
     } else {
       box.innerHTML = `<div class="bad">🔴 拒绝 ${r.route_id}（批准号 ${r.approval_id}）— 冲突依据：</div>
-        <pre>${r.conflicts.map((c) => `• [${c.type}] ${c.resource}${c.held_by_route ? ` 被 ${c.held_by_route}(实例#${c.held_by_instance}) 占用/锁闭` : ''}`).join('\n')}</pre>`;
+        <pre>${r.conflicts.map((c) => `• [${c.type}] ${c.resource}${c.via_flank ? `（侧防 ${c.via_flank} 所指实体）` : ''}${c.held_by_route ? ` 被 ${c.held_by_route}(实例#${c.held_by_instance})${c.held_as && c.held_as.startsWith('flank_') ? ' 以侧防方式' : ''} 占用/锁闭` : ''}`).join('\n')}</pre>`;
     }
     await refresh();
   } catch (e) {

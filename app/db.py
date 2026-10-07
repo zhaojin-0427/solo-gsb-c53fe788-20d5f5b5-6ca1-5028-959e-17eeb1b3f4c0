@@ -119,7 +119,7 @@ CREATE TABLE IF NOT EXISTS instances (
 );
 CREATE TABLE IF NOT EXISTS locks (
     yard_id     TEXT NOT NULL,
-    resource_type TEXT NOT NULL,        -- section | switch | flank
+    resource_type TEXT NOT NULL,        -- section | switch | flank | flank_section | flank_switch
     resource_id TEXT NOT NULL,
     route_id    TEXT NOT NULL,
     instance_id INTEGER NOT NULL,

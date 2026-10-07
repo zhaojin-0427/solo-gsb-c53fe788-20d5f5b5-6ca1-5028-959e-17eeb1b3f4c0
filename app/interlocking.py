@@ -7,6 +7,15 @@
 ------------
 * 放行事务：核对进路每段“已知空闲”、道岔/侧防/区段均未被其他进路锁定，
   共用任一资源的进路互斥；成功后锁定全部资源并建立进路实例。
+* 侧防引用实体资源共享冲突判断：侧防资源 kind=section/switch 时，ref 所指
+  区段/道岔与“直接使用该实体”同等对待——所指区段被占用、或实体被其他进路
+  （直接或经另一侧防）锁定，均阻止批准；反之本进路持有侧防实体锁也阻止
+  其他进路直接使用该实体。generic 侧防为独立资源，仅按侧防 ID 互斥。
+* 锁归属与释放时机：直接区段锁（section）随列车推进逐段释放；道岔锁
+  （switch）、侧防 ID 锁（flank）与侧防实体锁（flank_section/flank_switch）
+  一律持有到末段出清。同一实体被本进路直接使用又被侧防引用时，两种锁
+  分别登记（不同类型、各写一次），普通区段逐段释放不会提前解除侧防保护；
+  同一实体被多个侧防引用时实体锁只写一次。
 * 列车按进路顺序逐段占用；仅当后继段确认占用后本段方可出清释放。
 * 道岔与侧防锁定到末段出清（无论中间段释放顺序）。
 * 末段出清不是当然完成：须结合实例位置、锁归属与当前占用复核——仍由本实例
@@ -256,55 +265,152 @@ def import_yard(conn: sqlite3.Connection, raw: Any) -> dict:
 # --------------------------------------------------------------------- #
 # 放行裁决
 # --------------------------------------------------------------------- #
-def _wanted_resources(route: dict) -> list[tuple[str, str, str | None]]:
-    """进路需要的全部互斥资源：(resource_type, resource_id, switch_position)。
+def _flank_map(conn: sqlite3.Connection, yard_id: str, flank_ids: list[str]) -> dict[str, tuple[str, str]]:
+    """侧防 ID -> (kind, ref)。导入时已校验引用存在；缺省按 generic 兜底。"""
+    if not flank_ids:
+        return {}
+    rows = conn.execute(
+        f"SELECT resource_id, kind, ref FROM resources WHERE yard_id=? "
+        f"AND resource_id IN ({','.join('?' * len(flank_ids))})",
+        (yard_id, *flank_ids),
+    ).fetchall()
+    return {r["resource_id"]: (r["kind"], r["ref"]) for r in rows}
 
-    区段、道岔（含位置）、侧防——等待试探与正式批准共用此清单，保证两者
-    的资源判定完全一致。
+
+def _wanted_resources(
+    conn: sqlite3.Connection, yard_id: str, route: dict
+) -> list[tuple[str, str, str | None]]:
+    """进路要写入的全部互斥锁：(resource_type, resource_id, switch_position)。
+
+    * 直接资源：区段（section，逐段释放）、道岔（switch，持到末段出清）；
+    * 每个侧防先登记侧防 ID 锁（flank，持到末段出清）；
+    * 侧防 kind=section/switch 时再登记**侧防实体锁**
+      （flank_section/flank_switch，持到末段出清），与直接使用同一实体的
+      进路共享冲突判断；generic 仅侧防 ID 锁，独立互斥。
+
+    同一实体被本进路直接使用又被侧防引用时落在不同锁类型上、各写一次；
+    同一实体被多个侧防引用时实体锁去重只写一次（locks 主键唯一）。
+    等待试探与正式批准共用此清单，保证两者的资源判定完全一致。
     """
     wanted: list[tuple[str, str, str | None]] = [("section", sid, None) for sid in route["sections"]]
     wanted += [("switch", wid, pos) for wid, pos in route["switches"].items()]
-    wanted += [("flank", fid, None) for fid in route["flank"]]
-    return wanted
+    fmap = _flank_map(conn, yard_id, route["flank"])
+    for fid in route["flank"]:
+        kind, ref = fmap.get(fid, ("generic", fid))
+        wanted.append(("flank", fid, None))
+        if kind == "section":
+            wanted.append(("flank_section", ref, None))
+        elif kind == "switch":
+            wanted.append(("flank_switch", ref, None))
+    seen: set[tuple[str, str]] = set()
+    out: list[tuple[str, str, str | None]] = []
+    for w in wanted:
+        key = (w[0], w[1])
+        if key not in seen:
+            seen.add(key)
+            out.append(w)
+    return out
+
+
+def _wanted_checks(
+    conn: sqlite3.Connection, yard_id: str, route: dict
+) -> list[tuple[str, str, str | None]]:
+    """冲突检查清单：(实体组, 实体ID, 来源侧防ID)。
+
+    侧防 kind=section/switch 展开为所指实体（via_flank 记录来源侧防 ID），
+    与直接使用同一实体的进路共享同一份占用/锁判定；generic 只查侧防 ID。
+    同一实体被本进路直接使用又被侧防引用时按实体去重（直接使用优先）。
+    """
+    checks: list[tuple[str, str, str | None]] = [("section", sid, None) for sid in route["sections"]]
+    checks += [("switch", wid, None) for wid in route["switches"]]
+    fmap = _flank_map(conn, yard_id, route["flank"])
+    for fid in route["flank"]:
+        kind, ref = fmap.get(fid, ("generic", fid))
+        checks.append(("flank", fid, None))
+        if kind == "section":
+            checks.append(("section", ref, fid))
+        elif kind == "switch":
+            checks.append(("switch", ref, fid))
+    seen: set[tuple[str, str]] = set()
+    out: list[tuple[str, str, str | None]] = []
+    for c in checks:
+        key = (c[0], c[1])
+        if key not in seen:
+            seen.add(key)
+            out.append(c)
+    return out
+
+
+# 实体组 -> 参与互斥的锁类型：直接锁与侧防实体锁共享同一把实体互斥
+_ENTITY_LOCK_TYPES = {
+    "section": ("section", "flank_section"),
+    "switch": ("switch", "flank_switch"),
+    "flank": ("flank",),
+}
+
+
+def _entity_key(lock_type: str, resource_id: str) -> tuple[str, str]:
+    """锁类型归一到实体键：直接锁与侧防实体锁指向同一实体，用于 FIFO 越过争用判定。"""
+    if lock_type in ("section", "flank_section"):
+        return ("section", resource_id)
+    if lock_type in ("switch", "flank_switch"):
+        return ("switch", resource_id)
+    return ("flank", resource_id)
 
 
 def _route_conflicts(conn: sqlite3.Connection, yard_id: str, route: dict) -> list[dict]:
     """只读资源判定（不写任何只增记录）。
 
     在调用方持有的事务内按当前已提交状态核对：
-    * 进路每一区段“已知空闲”（occupancy 表）；
-    * 区段、道岔、侧防资源均未被其他进路锁定（locks 表，故障实例的锁保留）。
+    * 进路每一区段“已知空闲”（occupancy 表）——含侧防 kind=section 所指
+      区段，所指区段被占用同样阻止批准；
+    * 区段、道岔、侧防资源均未被其他进路锁定（locks 表，故障实例的锁保留）——
+      侧防引用的实体与直接使用共享冲突判断：任一方向持锁（直接锁或
+      侧防实体锁）都互相阻止。
 
     因为整个“试探 → 批准”序列都在同一个 BEGIN IMMEDIATE 写事务内，试探
     读到的状态在批准前不会被任何并发写改变；试探受阻时不写拒绝记录，
     随后状态变化再重试即可，因此重试不会产生只增拒绝（不假拒绝）。
     """
-    sections: list[str] = route["sections"]
+    checks = _wanted_checks(conn, yard_id, route)
     conflicts: list[dict] = []
-    occupied_rows = conn.execute(
-        f"SELECT section_id, occupied FROM occupancy WHERE yard_id=? AND section_id IN "
-        f"({','.join('?' * len(sections))})",
-        (yard_id, *sections),
-    ).fetchall()
-    for row in occupied_rows:
-        if row["occupied"]:
-            conflicts.append({"type": "section_occupied", "resource": row["section_id"]})
 
-    for rtype, rid, _pos in _wanted_resources(route):
+    # 占用：进路区段 + 侧防所指区段（实体级，已去重）
+    sec_checks = [(sid, via) for grp, sid, via in checks if grp == "section"]
+    if sec_checks:
+        occupied_rows = conn.execute(
+            f"SELECT section_id, occupied FROM occupancy WHERE yard_id=? AND section_id IN "
+            f"({','.join('?' * len(sec_checks))})",
+            (yard_id, *[sid for sid, _ in sec_checks]),
+        ).fetchall()
+        occupied = {r["section_id"] for r in occupied_rows if r["occupied"]}
+        for sid, via in sec_checks:
+            if sid in occupied:
+                c: dict = {"type": "section_occupied", "resource": sid}
+                if via:
+                    c["via_flank"] = via
+                conflicts.append(c)
+
+    # 锁：按实体组共享判断（直接锁与侧防实体锁互相可见）
+    for grp, rid, via in checks:
+        types = _ENTITY_LOCK_TYPES[grp]
         row = conn.execute(
-            "SELECT route_id, instance_id, switch_position FROM locks "
-            "WHERE yard_id=? AND resource_type=? AND resource_id=?",
-            (yard_id, rtype, rid),
+            f"SELECT resource_type, route_id, instance_id FROM locks "
+            f"WHERE yard_id=? AND resource_type IN ({','.join('?' * len(types))}) "
+            f"AND resource_id=?",
+            (yard_id, *types, rid),
         ).fetchone()
         if row:
-            conflicts.append(
-                {
-                    "type": f"{rtype}_locked",
-                    "resource": rid,
-                    "held_by_route": row["route_id"],
-                    "held_by_instance": row["instance_id"],
-                }
-            )
+            c = {
+                "type": f"{grp}_locked",
+                "resource": rid,
+                "held_by_route": row["route_id"],
+                "held_by_instance": row["instance_id"],
+                "held_as": row["resource_type"],
+            }
+            if via:
+                c["via_flank"] = via
+            conflicts.append(c)
     return _dedup_conflicts(conflicts)
 
 
@@ -326,7 +432,7 @@ def _grant(
     sections = route["sections"]
     switches = route["switches"]
     flanks = route["flank"]
-    wanted = _wanted_resources(route)
+    wanted = _wanted_resources(conn, yard_id, route)
 
     cur = conn.execute(
         "INSERT INTO approvals(yard_id, route_id, decision, signal, reasons, created_at) "
@@ -444,9 +550,9 @@ def _try_fulfill(conn: sqlite3.Connection, yard_id: str) -> list[dict]:
     * **等待试探与正式批准同一事务**：每项先用 :func:`_route_conflicts`
       只读试探，受阻**不写任何拒绝记录**（重试不会产生只增假拒绝），
       无冲突则同一事务内 :func:`_grant` 原子建立批准/实例/锁；
-    * **较早受阻则后项不得争用**：维护本轮受阻前项的资源并集，后项仅在
-      既不与任何实际锁/占用冲突、也**不与任一受阻前项争用资源**时才可
-      越过放行，否则一并等待；
+    * **较早受阻则后项不得争用**：维护本轮受阻前项的**实体级**资源并集
+      （侧防引用展开为所指区段/道岔实体），后项仅在既不与任何实际锁/占用
+      冲突、也**不与任一受阻前项争用实体资源**时才可越过放行，否则一并等待；
     * **故障持锁的冲突项继续等待**：故障实例锁保留，体现在 *_locked 判定中。
     """
     granted: list[dict] = []
@@ -457,13 +563,13 @@ def _try_fulfill(conn: sqlite3.Connection, yard_id: str) -> list[dict]:
         "SELECT * FROM pending_requests WHERE yard_id=? AND status='waiting' ORDER BY id",
         (yard_id,),
     ).fetchall()
-    blocked_union: set[tuple[str, str]] = set()  # 本轮受阻前项的期望资源并集
+    blocked_union: set[tuple[str, str]] = set()  # 本轮受阻前项的期望实体资源并集
     for row in rows:
         route = json.loads(
             conn.execute("SELECT data FROM routes WHERE yard_id=? AND route_id=?",
                          (yard_id, row["route_id"])).fetchone()["data"]
         )
-        wanted_keys = {(t, r) for t, r, _p in _wanted_resources(route)}
+        wanted_keys = {_entity_key(t, r) for t, r, _p in _wanted_resources(conn, yard_id, route)}
         real_conflicts = _route_conflicts(conn, yard_id, route)
         if real_conflicts or (wanted_keys & blocked_union):
             # 自身受阻：其期望资源并入受阻并集，挡住后续争用同资源的后项
@@ -1035,9 +1141,11 @@ def reset_instance(conn: sqlite3.Connection, instance_id: int) -> dict:
         ).fetchall()
         busy = [r["section_id"] for r in rows if r["occupied"]]
         # 还需确认没有列车压在进路相关区段上（ occupancy 已覆盖），
-        # 以及所有进路段当前不再被其他锁引用（本实例外）。
+        # 以及所有进路段当前不再被其他锁引用（本实例外）——含其他进路
+        # 对这些区段的侧防实体锁（flank_section），实体共享同一把互斥。
         foreign = conn.execute(
-            f"SELECT resource_id FROM locks WHERE yard_id=? AND resource_type='section' "
+            f"SELECT resource_id FROM locks WHERE yard_id=? "
+            f"AND resource_type IN ('section','flank_section') "
             f"AND instance_id<>? AND resource_id IN ({','.join('?' * len(sections))})",
             (yard_id, instance_id, *sections),
         ).fetchall()
